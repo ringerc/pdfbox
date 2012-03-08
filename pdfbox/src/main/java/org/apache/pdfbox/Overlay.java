@@ -16,6 +16,8 @@
  */
 package org.apache.pdfbox;
 
+import java.awt.geom.AffineTransform;
+import java.io.*;
 import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
@@ -30,18 +32,13 @@ import org.apache.pdfbox.pdmodel.PDDocumentCatalog;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
 
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.OutputStream;
 
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.TreeMap;
 import java.util.Map;
+import org.apache.pdfbox.cos.*;
 
 /**
  * Overlay on document with another one.<br>
@@ -82,9 +79,8 @@ public class Overlay
     private PDDocument pdfOverlay;
     private PDDocument pdfDocument;
     private int pageCount = 0;
-    private COSStream saveGraphicsStateStream;
-    private COSStream restoreGraphicsStateStream;
-
+    private COSStream saveGraphicsStateStream, restoreGraphicsStateStream, transformCoordsStream;
+    
     /**
      * This will overlay a document and write out the results.<br/><br/>
      *
@@ -97,38 +93,90 @@ public class Overlay
      */
     public static void main( String[] args ) throws IOException, COSVisitorException
     {
-        if( args.length != 3 )
+        if( args.length < 3 )
         {
             usage();
             System.exit(1);
         }
-        else
-        {
-            PDDocument overlay = null;
-            PDDocument pdf = null;
-
-            try
-            {
-                overlay = getDocument( args[0] );
-                pdf = getDocument( args[1] );
-                Overlay overlayer = new Overlay();
-                overlayer.overlay( overlay, pdf );
-                writeDocument( pdf, args[2] );
+        
+        double  tx = 0d, ty = 0d,
+                xscale = 1d, yscale = 1d,
+                rotate = 0d;
+        
+        for (int i = 0; i < args.length - 3; i++) {
+            String opt = args[i], optVal = null;
+            if (!opt.startsWith(("--"))) {
+                System.err.println("Too many non-option arguments");
+                usage();
+                System.exit(1);
             }
-            finally
+            int separator = opt.indexOf('=');
+            if (separator > 0) {
+                optVal = opt.substring(separator+1, opt.length());
+                opt = opt.substring(2, separator);
+            }
+            try {
+                if (opt.equals("x")) {
+                    tx = Double.parseDouble(optVal);
+                } else if (opt.equals("y")) {
+                    ty = Double.parseDouble(optVal);
+                } else if (opt.equals("xs")) {
+                    xscale = Double.parseDouble(optVal);
+                } else if (opt.equals("ys")) {
+                    yscale = Double.parseDouble(optVal);
+                } else if (opt.equals("r")) {
+                    rotate = Double.parseDouble(optVal);
+                } else {
+                    System.err.println("Unknown command-line option --" + opt);
+                    usage();
+                    System.exit(1);
+                }
+            } catch (NullPointerException ex) {
+                System.err.println("Option " + opt + " requires a value after the = sign");
+                usage();
+                System.exit(1);
+            } catch (NumberFormatException ex) {
+                System.err.println("Option " + opt + ": could not parse number " + optVal + ": " + ex);
+                usage();
+                System.exit(1);
+            }
+        }
+        if (xscale == 0 || yscale == 0) {
+            System.err.println("WARNING: X and/or Y scaling factors are zero. Overlay will be invisible.");            
+        }
+        AffineTransform transform = AffineTransform.getTranslateInstance(tx, ty);
+        transform.concatenate(AffineTransform.getRotateInstance(- Math.toRadians(rotate)));
+        transform.concatenate(AffineTransform.getScaleInstance(xscale, yscale));
+        
+        String overlayFile = args[args.length - 3];
+        String targetFile = args[args.length - 2];
+        String outputFile = args[args.length - 1];
+        
+        // Now do the actual overlay work.
+        PDDocument overlay = null;
+        PDDocument pdf = null;
+
+        try
+        {
+            overlay = getDocument( overlayFile );
+            pdf = getDocument( targetFile );
+            Overlay overlayer = new Overlay();
+            overlayer.overlay( overlay, transform, pdf);
+            writeDocument( pdf, outputFile );
+        }
+        finally
+        {
+            if( overlay != null )
             {
-                if( overlay != null )
-                {
-                    overlay.close();
-                }
-                if( pdf != null )
-                {
-                    pdf.close();
-                }
+                overlay.close();
+            }
+            if( pdf != null )
+            {
+                pdf.close();
             }
         }
     }
-
+            
     private static void writeDocument( PDDocument pdf, String filename ) throws IOException, COSVisitorException
     {
         FileOutputStream output = null;
@@ -176,11 +224,21 @@ public class Overlay
 
     private static void usage()
     {
-        System.err.println( "usage: java -jar pdfbox-app-x.y.z.jar Overlay <overlay.pdf> <document.pdf> <result.pdf>" );
+        System.err.println("usage: java -jar pdfbox-app-x.y.z.jar Overlay [opts] <overlay.pdf> <document.pdf> <result.pdf>" );
+        System.err.println("");
+        System.err.println("\t--x=n  Offset of left edge of overlay from left edge of page.");
+        System.err.println("\t--y=n  Offset of bottom edge of overlay from bottom edge of page.");
+        System.err.println("\t--xs=n Horizontal scale factor, 1 (default) = no scaling");
+        System.err.println("\t--ys=n Vertical scale factor, 1 (default) = no scaling");
+        System.err.println("\t--r=n  Clockwise rotation.");
+        System.err.println("");
+        System.err.println("\tLengths are in target page units. Rotation is in degrees.");
+        System.err.println("\tScale is a multiplier. Negative scale factors mirror that axis.");
     }
 
     /**
-     * Private class.
+     * Struct-like holder for information about a page in the target
+     * document, must not be exposed outside class.
      */
     private static class LayoutPage
     {
@@ -204,41 +262,74 @@ public class Overlay
     }
 
     /**
+     * As the three-argument form of overlay(...), but doesn't apply any transform
+     * to the overlay.
+     * 
+     * @param overlay Document to overlay onto the destination
+     * @param destination Document to apply overlay to
+     * @return The destination PDF, same as argument passed in
+     * @throws IOException If there's an error on access to inputs
+     */
+    public PDDocument overlay( PDDocument overlay, PDDocument destination) throws IOException
+    {
+        return overlay(overlay, null, destination);
+    }
+
+    /**
      * This will overlay two documents onto each other.  The overlay document is
      * repeatedly overlayed onto the destination document for every page in the
      * destination.
      *
      * @param overlay The document to copy onto the destination
+     * @param transform An affine transform for translating/rotating/scaling the overlay, no-op if null
      * @param destination The file that the overlay should be placed on.
      *
      * @return The destination pdf, same as argument passed in.
      *
      * @throws IOException If there is an error accessing data.
      */
-    public PDDocument overlay( PDDocument overlay, PDDocument destination ) throws IOException
+    public PDDocument overlay( PDDocument overlay, AffineTransform transform, PDDocument destination) throws IOException
     {
         pdfOverlay = overlay;
         pdfDocument = destination;
 
         PDDocumentCatalog overlayCatalog = pdfOverlay.getDocumentCatalog();
         collectLayoutPages( overlayCatalog.getAllPages() );
-
-        COSDictionary saveGraphicsStateDic = new COSDictionary();
-        saveGraphicsStateStream = new COSStream( saveGraphicsStateDic, pdfDocument.getDocument().getScratchFile() );
-        OutputStream saveStream = saveGraphicsStateStream.createUnfilteredStream();
-        saveStream.write( " q\n".getBytes("ISO-8859-1") );
-        saveStream.flush();
-
-        restoreGraphicsStateStream = new COSStream( saveGraphicsStateDic, pdfDocument.getDocument().getScratchFile() );
-        OutputStream restoreStream = restoreGraphicsStateStream.createUnfilteredStream();
-        restoreStream.write( " Q\n".getBytes("ISO-8859-1") );
-        restoreStream.flush();
-
-
+        
+        saveGraphicsStateStream = makeStreamFromBytes(pdfDocument, " q\n".getBytes("ISO-8859-1"));
+        restoreGraphicsStateStream = makeStreamFromBytes(pdfDocument, " Q\n".getBytes("ISO-8859-1"));
+        if (transform != null) {
+            transformCoordsStream = makeStreamFromBytes(pdfDocument, affineTransformToCM(transform));
+        }
+        
         PDDocumentCatalog pdfCatalog = pdfDocument.getDocumentCatalog();
         processPages( pdfCatalog.getAllPages() );
 
         return pdfDocument;
+    }
+    
+    // Produce a PDF stream containing the passed bytes. This is just a helper
+    // method because we need to produce several small streams.
+    private COSStream makeStreamFromBytes(PDDocument doc, byte[] streamBytes) throws IOException {
+        COSStream st = new COSStream( doc.getDocument().getScratchFile() );
+        OutputStream restoreStream = st.createUnfilteredStream();
+        restoreStream.write(streamBytes);
+        restoreStream.flush();
+        return st;
+    }
+    
+    // The PDF "cm" operator expects six numbers as arguments. These are the
+    // usual affine transform values for scale/slant/translate, and are expected
+    // by cm in the same order that they're emitted by Java's AffineTransform.
+    private byte[] affineTransformToCM(AffineTransform transform) throws UnsupportedEncodingException {
+        double[] matrix = new double[6];
+        transform.getMatrix(matrix);
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < 6; i++){
+            b.append(matrix[i]).append(' ');
+        }
+        b.append("cm\n");
+        return b.toString().getBytes("ISO-8859-1");
     }
 
     private void collectLayoutPages( List pages) throws IOException
@@ -277,7 +368,7 @@ public class Overlay
     }
 
     private COSStream makeUniqObjectNames(Map objectNameMap, COSStream stream) throws IOException
-    {
+    {        
         ByteArrayOutputStream baos = new ByteArrayOutputStream(10240);
 
         byte[] buf = new byte[10240];
@@ -420,9 +511,16 @@ public class Overlay
         //<save graphics state>
         //<all existing content streams>
         //<restore graphics state>
+        //<translate, rotate, scale> (cm operator)
         //<overlay content>
+        //
+        // TODO: Clip overlay document to its transformed clip region, PDF:2008 8.5.4
+
         array.add(0, saveGraphicsStateStream );
         array.add( restoreGraphicsStateStream );
+        if (transformCoordsStream != null) {
+            array.add( transformCoordsStream );
+        }
         array.add(layoutPage.contents);
     }
 
