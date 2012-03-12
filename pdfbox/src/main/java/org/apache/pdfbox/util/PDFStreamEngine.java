@@ -18,17 +18,7 @@ package org.apache.pdfbox.util;
 
 import java.io.IOException;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.Stack;
+import java.util.*;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -37,7 +27,6 @@ import org.apache.pdfbox.cos.COSObject;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.exceptions.WrappedIOException;
 
-import org.apache.pdfbox.pdfparser.PDFStreamParser;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
 
@@ -53,14 +42,20 @@ import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObject;
 import org.apache.pdfbox.util.operator.OperatorProcessor;
 
 /**
- * This class will run through a PDF content stream and execute certain operations
- * and provide a callback interface for clients that want to do things with the stream.
+ * This class will run through a PDF content stream, invoking handlers for each
+ * PDF operator encountered in the stream.
+ * 
+ * PDFStreamEngine and the associated OperatorProcessor implementations can
+ * maintain a graphics state stack, assemble text content, etc. If you don't
+ * need any of this functionality, consider using the simpler base class 
+ * PDFStreamProcessor.
+ * 
  * See the PDFTextStripper class for an example of how to use this class.
  *
  * @author <a href="mailto:ben@benlitchfield.com">Ben Litchfield</a>
  * @version $Revision: 1.38 $
  */
-public class PDFStreamEngine
+public class PDFStreamEngine extends PDFStreamProcessor
 {
 
     /**
@@ -70,6 +65,8 @@ public class PDFStreamEngine
 
     /**
      * The PDF operators that are ignored by this engine.
+     * This is cache maintained internally to allow repeat error
+     * messages to be suppressed and to speed up lookups.
      */
     private final Set<String> unsupportedOperators = new HashSet<String>();
     
@@ -80,8 +77,6 @@ public class PDFStreamEngine
     private Matrix textMatrix = null;
     private Matrix textLineMatrix = null;
     private Stack<PDGraphicsState> graphicsStack = new Stack<PDGraphicsState>();
-
-    private Map<String,OperatorProcessor> operators = new HashMap<String,OperatorProcessor>();
 
     private Stack<PDResources> streamResourcesStack = new Stack<PDResources>();
 
@@ -96,14 +91,14 @@ public class PDFStreamEngine
     private boolean forceParsing = false;
 
     /**
-     * Constructor.
+     * Construct a new PDFStreamEngine with no handlers registered.
      */
     public PDFStreamEngine()
     {
-        //default constructor
+        super();
         validCharCnt = 0;
         totalCharCnt = 0;
-        
+        super.setDefaultOperatorProcessor(new UnsupportedOperatorHandler());
     }
 
     /**
@@ -112,12 +107,19 @@ public class PDFStreamEngine
      * operators. An empty value means that the operator will be silently
      * ignored.
      *
+     * @deprecated This constructor may not work correctly where multiple classloaders
+     * are in use. It's recommended that you use the default constructor
+     * then use replaceOperatorProcessors(...).
+     * 
      * @param properties The engine properties.
      *
      * @throws IOException If there is an error setting the engine properties.
      */
+    // TODO PDFBOX20: Remove this constructor in favour of a HashMap<String,OperatorHandler> based ctor.
+    @Deprecated
     public PDFStreamEngine( Properties properties ) throws IOException
     {
+        this();
         if( properties == null ) 
         {
             throw new NullPointerException( "properties cannot be null" );
@@ -148,8 +150,19 @@ public class PDFStreamEngine
                 }
             }
         }
-        validCharCnt = 0;
-        totalCharCnt = 0;
+    }
+    
+    // When an operator that we don't have a registered handler for is encountered,
+    // this helper will report it the first time it's encountered.
+    private final class UnsupportedOperatorHandler implements OperatorHandler {
+        public void process(PDFOperator operator, List arguments) throws IOException {
+            String opStr = operator.getOperation();
+            if (!unsupportedOperators.contains(opStr)) 
+            {
+                LOG.info("unsupported/disabled operation: " + opStr);
+                unsupportedOperators.add(opStr);
+            }
+        }
     }
 
     /**
@@ -173,17 +186,50 @@ public class PDFStreamEngine
     }
 
     /**
-     * Register a custom operator processor with the engine.
-     *
-     * @param operator The operator as a string.
+     * Register an operator processor to handle an operator. 
+     * 
+     * @param operator Handler, must be an instance of OperatorProcessor
+     * @param op operator to register to handle
+     */
+    @Override
+    public void registerOperatorProcessor( String operator, OperatorHandler op )
+    {
+        if (op instanceof OperatorProcessor) {
+            registerOperatorProcessor(operator, (OperatorProcessor)op);
+        } else {
+            super.registerOperatorProcessor(operator, op);
+        }
+    }
+    
+    // Adapt OperatorProcessor to work with the OperatorHandler interface
+    private class OperatorProcessorAdapter implements OperatorHandler {
+        private final OperatorProcessor op;
+        public OperatorProcessorAdapter(OperatorProcessor op) {
+            this.op = op;
+            op.setContext(PDFStreamEngine.this);
+        }
+        public void process(PDFOperator operator, List<COSBase> arguments) throws IOException {
+            // Original PDFStreamEngine code sets a context at each invocation, so we do too
+            // though it seems pretty pointless. 
+            op.setContext(PDFStreamEngine.this);
+            // PDFStreamEngine copies the arguments array before passing it, unlike
+            // PDFStreamProcessor, so we must copy it here to preserve compatibility.
+            ArrayList<COSBase> argsCopy = new ArrayList<COSBase>(arguments);
+            op.process(operator, argsCopy);
+        }
+    }
+    
+    /**
+     * Register an operator processor to handle an operator.
+     * 
+     * @param operator The  operator as a string.
      * @param op Processor instance.
      */
     public void registerOperatorProcessor( String operator, OperatorProcessor op )
     {
-        op.setContext( this );
-        operators.put( operator, op );
+        registerOperatorProcessor(operator, new OperatorProcessorAdapter(op));
     }
-
+    
     /**
      * This method must be called between processing documents.  The
      * PDFStreamEngine caches information for the document between pages
@@ -234,7 +280,7 @@ public class PDFStreamEngine
             streamResourcesStack.push(resources);
             try
             {
-                processSubStream(cosStream);
+                super.processStream(cosStream, forceParsing);
             }
             finally
             {
@@ -243,46 +289,10 @@ public class PDFStreamEngine
         }
         else
         {
-            processSubStream(cosStream);
+            super.processStream(cosStream, forceParsing);
         }
     }
 
-    private void processSubStream(COSStream cosStream) throws IOException 
-    {
-        List<COSBase> arguments = new ArrayList<COSBase>();
-        PDFStreamParser parser = new PDFStreamParser(cosStream, forceParsing);
-        try 
-        {
-            Iterator<Object> iter = parser.getTokenIterator();
-            while (iter.hasNext()) 
-            {
-                Object next = iter.next();
-                if (LOG.isDebugEnabled()) 
-                {
-                    LOG.debug("processing substream token: " + next);
-                }
-                if (next instanceof COSObject) 
-                {
-                    arguments.add(((COSObject) next).getObject());
-                }
-                else if (next instanceof PDFOperator) 
-                {
-                    processOperator((PDFOperator) next, arguments);
-                    arguments = new ArrayList<COSBase>();
-                }
-                else
-                {
-                    arguments.add((COSBase) next);
-                }
-            }
-        }
-        finally
-        {
-            parser.close();
-        }
-    }
-
-    
     /**
      * A method provided as an event interface to allow a subclass to perform
      * some specific functionality when text needs to be processed.
@@ -516,58 +526,20 @@ public class PDFStreamEngine
     }
 
     /**
-     * This is used to handle an operation.
-     *
+     * Look up the PDFOperator for the operator name `operation' and invoke
+     * the PDFOperator-based version of processOperator with it.
+     * 
+     * @deprecated override the PDFOperator-based form of this method instead
+     * 
      * @param operation The operation to perform.
      * @param arguments The list of arguments.
      *
      * @throws IOException If there is an error processing the operation.
      */
+    @Deprecated
     public void processOperator( String operation, List<COSBase> arguments ) throws IOException
     {
-        try
-        {
-            PDFOperator oper = PDFOperator.getOperator( operation );
-            processOperator( oper, arguments );
-        }
-        catch (IOException e)
-        {
-            LOG.warn(e, e);
-        }
-    }
-
-    /**
-     * This is used to handle an operation.
-     *
-     * @param operator The operation to perform.
-     * @param arguments The list of arguments.
-     *
-     * @throws IOException If there is an error processing the operation.
-     */
-    protected void processOperator( PDFOperator operator, List<COSBase> arguments ) throws IOException
-    {
-        try
-        {
-            String operation = operator.getOperation();
-            OperatorProcessor processor = (OperatorProcessor)operators.get( operation );
-            if( processor != null )
-            {
-                processor.setContext(this);
-                processor.process( operator, arguments );
-            }
-            else
-            {
-                if (!unsupportedOperators.contains(operation)) 
-                {
-                    LOG.info("unsupported/disabled operation: " + operation);
-                    unsupportedOperators.add(operation);
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            LOG.warn(e, e);
-        }
+        processOperator( PDFOperator.getOperator( operation ), arguments );
     }
 
     /**
