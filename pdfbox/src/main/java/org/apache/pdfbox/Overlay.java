@@ -18,6 +18,7 @@ package org.apache.pdfbox;
 
 import java.awt.geom.AffineTransform;
 import java.io.*;
+import java.util.*;
 import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
@@ -33,12 +34,14 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
 
 
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.TreeMap;
-import java.util.Map;
 import org.apache.pdfbox.cos.*;
+import org.apache.pdfbox.pdfwriter.ContentStreamWriter;
+import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.common.COSObjectable;
+import org.apache.pdfbox.pdmodel.common.DualCOSObjectable;
+import org.apache.pdfbox.util.PDFOperator;
+import org.apache.pdfbox.util.PDFStreamProcessor;
+import org.apache.pdfbox.util.PDFStreamProcessor.OperatorHandler;
 
 /**
  * Overlay on document with another one.<br>
@@ -74,12 +77,13 @@ public class Overlay
      */
     public static final COSName EXT_G_STATE = COSName.EXT_G_STATE;
 
-    private List layoutPages = new ArrayList(10);
+    private List overlayPages = new ArrayList(10);
 
-    private PDDocument pdfOverlay;
-    private PDDocument pdfDocument;
-    private int pageCount = 0;
+    private PDDocument overlayDocument;
+    private PDDocument targetDocument;
     private COSStream saveGraphicsStateStream, restoreGraphicsStateStream, transformCoordsStream;
+    // Counter used to generate unique(ish) names.
+    private int nameIncrementCounter;
     
     /**
      * This will overlay a document and write out the results.<br/><br/>
@@ -240,11 +244,11 @@ public class Overlay
      * Struct-like holder for information about a page in the target
      * document, must not be exposed outside class.
      */
-    private static class LayoutPage
+    private static class OverlayPage
     {
-        private final COSBase contents;
+        private final COSArray contentsArray;
         private final COSDictionary res;
-        private final Map objectNameMap;
+        private final Map<COSName,COSName> objectNameMap;
 
         /**
          * Constructor.
@@ -253,9 +257,9 @@ public class Overlay
          * @param resValue The resource dictionary
          * @param objectNameMapValue The map
          */
-        public LayoutPage(COSBase contentsValue, COSDictionary resValue, Map objectNameMapValue)
+        public OverlayPage(COSArray contentsArray, COSDictionary resValue, Map<COSName,COSName> objectNameMapValue)
         {
-            contents = contentsValue;
+            this.contentsArray = contentsArray;
             res = resValue;
             objectNameMap = objectNameMapValue;
         }
@@ -289,25 +293,88 @@ public class Overlay
      * @throws IOException If there is an error accessing data.
      */
     public PDDocument overlay( PDDocument overlay, AffineTransform transform, PDDocument destination) throws IOException
-    {
-        pdfOverlay = overlay;
-        pdfDocument = destination;
-
-        PDDocumentCatalog overlayCatalog = pdfOverlay.getDocumentCatalog();
-        collectLayoutPages( overlayCatalog.getAllPages() );
+    {        
+        overlayDocument = overlay;
+        targetDocument = destination;
         
-        saveGraphicsStateStream = makeStreamFromBytes(pdfDocument, " q\n".getBytes("ISO-8859-1"));
-        restoreGraphicsStateStream = makeStreamFromBytes(pdfDocument, " Q\n".getBytes("ISO-8859-1"));
+        PDDocumentCatalog targetCatalog = targetDocument.getDocumentCatalog();
+        Set<COSName> targetUsedNames = new HashSet<COSName>();
+        resourceNamesUsedInPages(targetCatalog.getPages(), targetUsedNames);
+        
+        PDDocumentCatalog overlayCatalog = overlayDocument.getDocumentCatalog();
+        collectOverlayPages( overlayCatalog.getAllPages(), targetUsedNames );
+        
+        saveGraphicsStateStream = makeStreamFromBytes(targetDocument, " q\n".getBytes("ISO-8859-1"));
+        restoreGraphicsStateStream = makeStreamFromBytes(targetDocument, " Q\n".getBytes("ISO-8859-1"));
         if (transform != null) {
-            transformCoordsStream = makeStreamFromBytes(pdfDocument, affineTransformToCM(transform));
+            transformCoordsStream = makeStreamFromBytes(targetDocument, affineTransformToCM(transform));
         }
-        
-        PDDocumentCatalog pdfCatalog = pdfDocument.getDocumentCatalog();
-        processPages( pdfCatalog.getAllPages() );
 
-        return pdfDocument;
+        processTargetPages( targetCatalog.getAllPages() );
+
+        return targetDocument;
     }
     
+    /**
+     * Recursively scan a page tree for names used in resource dictionaries,
+     * adding each name to a set of known names.
+     * 
+     * @param pageTreeNode Node to start scanning at
+     * @param names Set to add names to
+     */
+    private static void resourceNamesUsedInPages(PDPageNode pageTreeNode, Set<COSName> names) {
+        List kids = pageTreeNode.getKids();
+        Iterator it = kids.iterator();
+        while (it.hasNext()) {
+            Object kid = it.next();
+            if (kid instanceof PDPage) {
+                // Add names from the resources dict to the list of known names
+                PDResources rsrcDict = ((PDPage)kid).getResources();
+                if (rsrcDict != null) {
+                    resourceNamesUsedInRsrcDict(rsrcDict.getCOSDictionary(), names);                    
+                }
+            } else if (kid instanceof PDPageNode) {
+                // Add names in the rsrc dict to the lsit of known names
+                PDResources rsrcDict = ((PDPage)kid).getResources();
+                if (rsrcDict != null) {
+                    resourceNamesUsedInRsrcDict(rsrcDict.getCOSDictionary(), names);                    
+                }
+                // .. and recurse depth-first down the tree
+                resourceNamesUsedInPages((PDPageNode)kid, names);
+            } else {
+                throw new IllegalStateException("Got PDPageNode with a kid of type " + kid.getClass().getName() + " instead of PDPage or PDPageNode");
+            }
+        }
+    }
+    
+    /**
+    * Produce a set of resource names showing which resource names are
+    * defined in a resources dictionary.
+    * 
+    * Only names in the /ExGState, /Font, /XObject, /Pattern, /Shading,
+    * /ColorSpace and /Properties dictionaries are considered. There's no guarantee
+    * that other resource dictionary entries are dictionaries of resource names.
+    * 
+    * @param resources Resources dictionary to scan for names
+    * @param resourceNames Set of resource names already accumulated, or empty set. Not null.
+    * @return Set of resource names found
+    */
+    private static void resourceNamesUsedInRsrcDict(COSDictionary resources, Set<COSName> resourceNames) {
+        // Assemble a map of resource names to the dictionaries they appear in.
+        // The info on where they appear is only for error reporting and debugging,
+        // otherwise the HashMap is really just being used like a set.
+        COSName[] rdicts = new COSName[]{ COSName.EXT_G_STATE, COSName.FONT, COSName.XOBJECT,
+                                        COSName.PATTERN, COSName.COLORSPACE, COSName.SHADING, COSName.PROPERTIES};
+        for (COSName n : rdicts) {
+            COSDictionary rd = (COSDictionary) resources.getDictionaryObject(n);
+            if (rd != null) {
+                for (Map.Entry<COSName,COSBase> e : rd.entrySet()) {
+                    resourceNames.add(e.getKey());
+                }
+            }
+        }
+    }
+        
     // Produce a PDF stream containing the passed bytes. This is just a helper
     // method because we need to produce several small streams.
     private COSStream makeStreamFromBytes(PDDocument doc, byte[] streamBytes) throws IOException {
@@ -332,7 +399,16 @@ public class Overlay
         return b.toString().getBytes("ISO-8859-1");
     }
 
-    private void collectLayoutPages( List pages) throws IOException
+    /**
+     * Iterate through the pages in the overlay document, creating an entry
+     * in overlayPages containing the resources dict, content stream(s),
+     * etc for each.
+     * 
+     * @param pages List of pages in the overlay PDF
+     * @param targetUsedNames Set of names defined in any resources dict entry in the target document (not the overlay)
+     * @throws IOException
+     */
+    private void collectOverlayPages( List pages, Set<COSName> targetUsedNames ) throws IOException
     {
         Iterator pagesIter = pages.iterator();
         while( pagesIter.hasNext() )
@@ -340,6 +416,7 @@ public class Overlay
             PDPage page = (PDPage)pagesIter.next();
             COSBase contents = page.getCOSDictionary().getDictionaryObject( COSName.CONTENTS );
             PDResources resources = page.findResources();
+            Map<COSName,COSName> renameMap = makeRenameMap(resources.getCOSDictionary(), targetUsedNames);
             if( resources == null )
             {
                 resources = new PDResources();
@@ -347,163 +424,301 @@ public class Overlay
             }
             COSDictionary res = resources.getCOSDictionary();
 
-            if( contents instanceof COSStream )
-            {
-                COSStream stream = (COSStream) contents;
-                Map objectNameMap = new TreeMap();
-                stream = makeUniqObjectNames(objectNameMap, stream);
+            // Collect the stream(s) to iterate over. Whether the original page
+            // had a single stream or an array, we're going to produce an array.
+            List<COSStream> streams = new ArrayList();
+            if (contents instanceof COSArray) {
+                for (COSBase stream : (COSArray)contents) {
+                    streams.add((COSStream)stream);
+                }
+            } else if (contents instanceof COSStream) {
+                streams.add((COSStream)contents);
+            } else {
+                throw new IllegalArgumentException("Unexpected page /Contents entry not stream or array");
+            }
 
-                layoutPages.add(new LayoutPage(stream, res, objectNameMap));
-            }
-            else if( contents instanceof COSArray )
+            COSArray newStreams = new COSArray();
+            for (COSStream stream : streams)
             {
-                throw new UnsupportedOperationException("Layout pages with COSArray currently not supported.");
-                // layoutPages.add(new LayoutPage(contents, res));
+                newStreams.add(copyStreamWithNameRemapping(stream, renameMap));
             }
-            else
-            {
-                throw new IOException( "Contents are unknown type:" + contents.getClass().getName() );
-            }
+            
+            overlayPages.add(new OverlayPage(newStreams, res, renameMap));
+
         }
     }
+    
+    /**
+     * Determine which resource reference names in the resources dictionary from
+     * an overlay page (overlayResources) need to be renamed to avoid clashes with
+     * names used in the target document.
+     * 
+     * @param overlayResources Resources dictionary from overlay page
+     * @param rsrcNamesUsedInTarget Names used in target document
+     * @return Mapping of old (clashing) to new (unique) names
+     */
+    private Map<COSName,COSName> makeRenameMap(COSDictionary overlayResources, Set<COSName> rsrcNamesUsedInTarget)
+    {   HashMap<COSName,COSName> renamedResourecs = new HashMap<COSName,COSName>();
+        HashSet<COSName> overlayRsrcNames = new HashSet<COSName>();
+        resourceNamesUsedInRsrcDict(overlayResources, overlayRsrcNames);
+        // Find conflicting names
+        Set<COSName> conflictRsrcNames = new HashSet<COSName>(overlayRsrcNames);
+        conflictRsrcNames.retainAll(rsrcNamesUsedInTarget);
+        // Map each conflicting name to a new non-conflicting name
+        for (COSName conflictingName : conflictRsrcNames) {
+            COSName newName = makeNonConflictingName(conflictingName, rsrcNamesUsedInTarget, overlayRsrcNames);
+            renamedResourecs.put(conflictingName, newName);
+        }
+        return renamedResourecs;
+    }   
+        
+    /**
+     * For a PDF resource entry name `conflictingName', generate a new name
+     * that doesn't clash with any of the names in `usedNames1' or `usedNames2'.
+     * 
+     * The name generation/alteration strategy is not specified and should not
+     * be relied upon. The only guarantee provided is that a non-conflicting
+     * name that's within the 63-char PDF name length limit will be produced.
+     * 
+     * @param conflictingName Name to create a replacement for
+     * @param usedNames1 First set of names to check for clash.
+     * @param usedNames2 Second set of names to check for clash.
+     * @return New, non-conflicting name
+     */
+    private COSName makeNonConflictingName(COSName conflictingName, Set<COSName> usedNames1, Set<COSName> usedNames2) {
+        // Initial strategy: Append "Onnn" where "nnn" is sequential
+        COSName newName = conflictingName;
+        do {
+            newName = COSName.getPDFName(newName.getName() + "O" + nameIncrementCounter++);
+            if (newName.getName().length() > 127) {
+                // PDF:2008 Table C.1 Architectural Limits specifies
+                // that a name should be no more than 127 bytes. 
+            }
+        } while (usedNames1.contains(newName) || usedNames2.contains(newName));
+        return newName;
+    }
+    
+    /**
+     * ResourceRenamer scans a resources dictionary and one or more content streams,
+     * looking for resource names that clash with a supplied list of already-taken names.
+     * 
+     * For each clashing name it renames the object in the resources dictionary and rewrites all
+     * references to it in the content stream to use the new name.
+     */
+    private static final class ResourceRenamer extends PDFStreamProcessor {
+    
+        // Names in the overlay's resources dictionary.
+        private static final HashMap<PDFOperator,OperatorInfo> operators
+                = new HashMap<PDFOperator,OperatorInfo>();
+        private final Map<COSName,COSName> renamedResources;
+        private final ContentStreamWriter outputStream;
+        private int nameIncrementCounter = 0;
+        
+        // This struct-like POD class defines which operators we check for names
+        // and where to look for the names.
+        private static final class OperatorInfo {
+            final PDFOperator op;
+            final int numArgs;
+            final int[] nameArgIndexes;
+            OperatorInfo(PDFOperator op, int numArgs, int ... nameArgIndexes) {
+                this.op = op;
+                this.numArgs = numArgs;
+                this.nameArgIndexes = nameArgIndexes;
+                assert(numArgs >= nameArgIndexes.length);
+            }
+            static void add(HashMap<PDFOperator,OperatorInfo> operators, String operator, int numArgs, int ... nameArgIndexes) {
+                PDFOperator op = PDFOperator.getOperator(operator);
+                operators.put(op, new OperatorInfo(op, numArgs, nameArgIndexes));
+            }
+        }
+                
+        static {
+            OperatorInfo.add(operators, "gs", 1, 0);
+            OperatorInfo.add(operators, "Tf", 2, 0);
+            OperatorInfo.add(operators, "Do", 1, 0);
+            //OperatorInfo.add(operators, "SCN", 1, 0);
+            //OperatorInfo.add(operators, "scn", 1, 0);
+            //OperatorInfo.add(operators, "BDC", 1, 0);
+            //OperatorInfo.add(operators, "DP", 1, 0);
+            //OperatorInfo.add(operators, "CS", 1, 0);
+            //OperatorInfo.add(operators, "cs", 1, 0);
+        }
+        
+        /**
+         * Create a new ResourceRenamer to process content streams that refer
+         * to the resources dictionary overlayResources. It will ensure that
+         * no name in `overlayResources' conflicts with any name in `busyNames'.
+         * 
+         * Every content stream that referred to `overlayResources' must be
+         * passed through the PDFStreamEngine that uses this ResourceRenamer,
+         * 
+         * 
+         * 
+         * @param overlayResources Resources dictionary from overlay
+         * @param busyResources Resources dictionary to avoid conflicts with
+         * @param outputStream Stream to write converted/renamed content stream data to
+         */
+        ResourceRenamer(Map<COSName,COSName> renameMap, ContentStreamWriter outputStream) {
+            this.outputStream = outputStream;
+            this.renamedResources = renameMap;
+            setDefaultOperatorProcessor(new ResourceRenamerOperatorHandler());
+        }
 
-    private COSStream makeUniqObjectNames(Map objectNameMap, COSStream stream) throws IOException
+        @Override
+        public void processStream(COSStream stream, boolean forceParsing) throws IOException {
+            super.processStream(stream, forceParsing);
+            outputStream.flush();
+        }
+        
+        private final class ResourceRenamerOperatorHandler implements OperatorHandler {
+            /**
+            * For each operator encountered, determine whether its arguments
+            * reference name(s) from the resources dictionary.
+            * 
+            * {@inheritDoc}
+            */
+            public void process(PDFOperator operator, List<COSBase> arguments) throws IOException {
+                List<COSBase> argsToWrite = arguments;
+                // Determine whether we need to rewrite this operator
+                OperatorInfo oi = operators.get(operator);
+                if (oi != null) {
+                    if (arguments.size() != oi.numArgs) {
+                        // TODO: For reuse, should really be a log message
+                        System.err.println("Unexpected number of args to op " + operator + ": " + arguments.size());
+                        for (COSBase arg : arguments)
+                        {
+                            System.err.println(arg + " ");
+                        }
+                        System.err.println(operator);
+                    } else {
+                        // We're altering the args so we must copy them
+                        argsToWrite = new ArrayList<COSBase>(arguments);
+                        // then replace any remapped names
+                        for (int index : oi.nameArgIndexes) {
+                            COSName oldName = (COSName) arguments.get(index);
+                            COSName remapped = renamedResources.get(oldName);
+                            if (remapped != null) {
+                                argsToWrite.set(index, remapped);
+                            }
+                        }
+                    }
+                }
+                // Having done any required name re-mapping, write the
+                // adjusted operation to the output stream.
+                outputStream.writeTokens(argsToWrite);
+                outputStream.writeToken(operator);
+            }
+        }
+        
+    }
+    
+    /**
+     * Copy a content stream, changing any resources dictionary reference names
+     * used in the stream to their replacements as defined in `renameMap'.
+     * 
+     * @param originalStream
+     * @param renameMap
+     * @return
+     * @throws IOException 
+     */
+    private COSStream copyStreamWithNameRemapping(COSStream originalStream, Map<COSName,COSName> renameMap) throws IOException
     {        
-        ByteArrayOutputStream baos = new ByteArrayOutputStream(10240);
-
-        byte[] buf = new byte[10240];
-        int read;
-        InputStream is = stream.getUnfilteredStream();
-        while ((read = is.read(buf)) > -1)
-        {
-            baos.write(buf, 0, read);
-        }
-
-        buf = baos.toByteArray();
-        baos = new ByteArrayOutputStream(buf.length + 100);
-        StringBuffer sbObjectName = new StringBuffer(10);
-        boolean bInObjectIdent = false;
-        boolean bInText = false;
-        boolean bInEscape = false;
-        for (int i = 0; i<buf.length; i++)
-        {
-            byte b = buf[i];
-
-            if (!bInEscape)
-            {
-                if (!bInText && b == '(')
-                {
-                    bInText = true;
-                }
-                if (bInText && b == ')')
-                {
-                    bInText = false;
-                }
-                if (b == '\\')
-                {
-                    bInEscape = true;
-                }
-
-                if (!bInText && !bInEscape)
-                {
-                    if (b == '/')
-                    {
-                        bInObjectIdent = true;
-                    }
-                    else if (bInObjectIdent && Character.isWhitespace((char) b))
-                    {
-                        bInObjectIdent = false;
-
-                        // System.err.println(sbObjectName);
-                        // String object = sbObjectName.toString();
-
-                        String objectName = sbObjectName.toString().substring(1);
-                        String newObjectName = objectName + "overlay";
-                        baos.write('/');
-                        baos.write(newObjectName.getBytes("ISO-8859-1"));
-
-                        objectNameMap.put(objectName, COSName.getPDFName(newObjectName));
-
-                        sbObjectName.delete(0, sbObjectName.length());
-                    }
-                }
-
-                if (bInObjectIdent)
-                {
-                    sbObjectName.append((char) b);
-                    continue;
-                }
-            }
-            else
-            {
-                bInEscape = false;
-            }
-
-            baos.write(b);
-        }
-
-        COSDictionary streamDict = new COSDictionary();
-        streamDict.setInt(COSName.LENGTH, baos.size());
-        COSStream output = new COSStream(streamDict, pdfDocument.getDocument().getScratchFile());
-        output.setFilters(stream.getFilters());
+        // Prepare a new stream to write results to
+        COSStream output = new COSStream(targetDocument.getDocument().getScratchFile());
+        output.setFilters(originalStream.getFilters());
         OutputStream os = output.createUnfilteredStream();
-        baos.writeTo(os);
-        os.close();
+        ContentStreamWriter ossw = new ContentStreamWriter(os, false);
+        
+        // Now scan the original content stream looking for names that appear in any
+        // resource dictionary. Copy the input stream to the output with any names
+        // substituted.
+        ResourceRenamer renamer = new ResourceRenamer(renameMap, ossw);
+        renamer.processStream(originalStream, true);
 
+        // The new content stream has been written.
+        ossw.flush();
+        os.close();
+        
         return output;
     }
 
-    private void processPages( List pages ) throws IOException
+    /**
+     * Apply the overlay to each page in the target page list
+     * 
+     * @param pages List of target pages
+     * @throws IOException
+     */
+    private void processTargetPages( List pages ) throws IOException
     {
+        int pageCount = 0;
         Iterator pageIter = pages.iterator();
         while( pageIter.hasNext() )
         {
-            PDPage page = (PDPage)pageIter.next();
-            COSDictionary pageDictionary = page.getCOSDictionary();
-            COSBase contents = pageDictionary.getDictionaryObject( COSName.CONTENTS );
-            if( contents instanceof COSStream )
-            {
-                COSStream contentsStream = (COSStream)contents;
-                // System.err.println("stream");
-
-                COSArray array = new COSArray();
-
-                array.add(contentsStream);
-
-                mergePage( array, page );
-
-                pageDictionary.setItem(COSName.CONTENTS, array);
-            }
-            else if( contents instanceof COSArray )
-            {
-                COSArray contentsArray = (COSArray)contents;
-
-                mergePage( contentsArray, page );
-            }
-            else
-            {
-                throw new IOException( "Contents are unknown type:" + contents.getClass().getName() );
-            }
+            int overlayPageNum = pageCount % overlayPages.size();
+            OverlayPage overlayPage = (OverlayPage) overlayPages.get(overlayPageNum);
+            PDPage targetPage = (PDPage)pageIter.next();
+            mergePage(overlayPage, targetPage);
             pageCount++;
         }
     }
+    
+    /**
+     * Get the /Contents of a page, ensuring it's an array by
+     * wrapping standalone content streams in single-element
+     * arrays where necessary.
+     * 
+     * The passed page may be modified.
+     * 
+     * @param page Page to get contents array of
+     * @return  The page's contents array
+     */
+    private COSArray getPageContentsArray(PDPage page) {
+        COSDictionary pageDictionary = page.getCOSDictionary();
+        COSBase contents = pageDictionary.getDictionaryObject( COSName.CONTENTS );
+        if( contents instanceof COSStream )
+        {
+            // Page's /Contents is a reference to a stream. We need
+            // it to be an array so we can append more streams to it.
+            // To do this, we just wrap it as a single-element array.
+            COSStream contentsStream = (COSStream)contents;
+            COSArray array = new COSArray();
+            array.add(contentsStream);
+            pageDictionary.setItem(COSName.CONTENTS, array);
+            contents = array;
+        }
+        // If the contents aren't a COSStream they must be COSArray
+        return (COSArray) contents;
+    }
 
-    private void mergePage(COSArray array, PDPage page )
+    /**
+     * Overlay the page `overlayPage' onto `targetPage', merging resources
+     * dictionaries and appending content streams.
+     * 
+     * The resources from `overlayPage' <i>must</i> be uniquely named,
+     * with no names the same as resources in `targetPage' or any
+     * resources dictionary of any parent of `targetPage'.
+     * 
+     * The target page is modified in-place.
+     * 
+     * @param overlayPage Contents and resources of page to overlay
+     * @param Page to apply overlay to
+     */
+    private void mergePage(OverlayPage overlayPage, PDPage targetPage )
     {
-        int layoutPageNum = pageCount % layoutPages.size();
-        LayoutPage layoutPage = (LayoutPage) layoutPages.get(layoutPageNum);
-        PDResources resources = page.findResources();
+        COSArray pageContents = getPageContentsArray(targetPage);
+        
+        PDResources resources = targetPage.findResources();
         if( resources == null )
         {
             resources = new PDResources();
-            page.setResources( resources );
+            targetPage.setResources( resources );
         }
-        COSDictionary docResDict = resources.getCOSDictionary();
-        COSDictionary layoutResDict = layoutPage.res;
-        mergeArray(COSName.PROC_SET, docResDict, layoutResDict);
-        mergeDictionary(COSName.FONT, docResDict, layoutResDict, layoutPage.objectNameMap);
-        mergeDictionary(COSName.XOBJECT, docResDict, layoutResDict, layoutPage.objectNameMap);
-        mergeDictionary(COSName.EXT_G_STATE, docResDict, layoutResDict, layoutPage.objectNameMap);
+        COSDictionary targetResDict = resources.getCOSDictionary();
+        COSDictionary overlayResDict = overlayPage.res;
+        mergeArray(COSName.PROC_SET, targetResDict, overlayResDict);
+        mergeDictionary(COSName.FONT, targetResDict, overlayResDict, overlayPage.objectNameMap);
+        mergeDictionary(COSName.XOBJECT, targetResDict, overlayResDict, overlayPage.objectNameMap);
+        mergeDictionary(COSName.EXT_G_STATE, targetResDict, overlayResDict, overlayPage.objectNameMap);
 
         //we are going to wrap the existing content around some save/restore
         //graphics state, so the result is
@@ -516,21 +731,26 @@ public class Overlay
         //
         // TODO: Clip overlay document to its transformed clip region, PDF:2008 8.5.4
 
-        array.add(0, saveGraphicsStateStream );
-        array.add( restoreGraphicsStateStream );
+        pageContents.add(0, saveGraphicsStateStream );
+        pageContents.add( restoreGraphicsStateStream );
         if (transformCoordsStream != null) {
-            array.add( transformCoordsStream );
+            pageContents.add( transformCoordsStream );
         }
-        array.add(layoutPage.contents);
+        pageContents.addAll(overlayPage.contentsArray);
     }
 
     /**
-     * merges two dictionaries.
+     * Merges `source' into `dest', renaming any entries in `source' according
+     * to `objectNameMap' when merging.
+     * 
+     * The source dictionary is unchanged, and the destination dictionary is
+     * the union of the destination and of the source transformed by objectNameMap.
      *
-     * @param dest
-     * @param source
+     * @param dest Dictionary to merge into
+     * @param source Dictionary to merge entries from
+     * @param objectNameMap Mapping of names in `source' to the names that should appear in `dest'
      */
-    private void mergeDictionary(COSName name, COSDictionary dest, COSDictionary source, Map objectNameMap)
+    private void mergeDictionary(COSName name, COSDictionary dest, COSDictionary source, Map<COSName,COSName> objectNameMap)
     {
         COSDictionary destDict = (COSDictionary) dest.getDictionaryObject(name);
         COSDictionary sourceDict = (COSDictionary) source.getDictionaryObject(name);
@@ -545,10 +765,17 @@ public class Overlay
 
             for (Map.Entry<COSName, COSBase> entry : sourceDict.entrySet())
             {
-                COSName mappedKey = (COSName) objectNameMap.get(entry.getKey().getName());
+                COSName mappedKey = (COSName) objectNameMap.get(entry.getKey());
                 if (mappedKey != null)
                 {
+                    // This entry has been renamed, so assign the new name
+                    // in the target dict.
                     destDict.setItem(mappedKey, entry.getValue());
+                }
+                else
+                {
+                    // Copy without renaming
+                    destDict.setItem(entry.getKey(), entry.getValue());
                 }
             }
         }

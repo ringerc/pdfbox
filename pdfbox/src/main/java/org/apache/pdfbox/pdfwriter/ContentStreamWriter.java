@@ -44,6 +44,10 @@ import org.apache.pdfbox.util.PDFOperator;
 public class ContentStreamWriter
 {
     private OutputStream output;
+    
+    // Whether to flush after every write or wait for an explicit flush
+    private final boolean flushAfterWrite;
+    
     /**
      * space character.
      */
@@ -61,7 +65,20 @@ public class ContentStreamWriter
      */
     public ContentStreamWriter( OutputStream out )
     {
+        this(out, true);
+    }
+    
+    /**
+     * Create a new content stream writer with control over whether
+     * the output stream is flushed after every write.
+     * 
+     * @param out Output stream to write to
+     * @param flushAfterWrite True to flush() after every writeTokens(..)
+     */
+    public ContentStreamWriter( OutputStream out, boolean flushAfterWrite ) 
+    {
         output = out;
+        this.flushAfterWrite = flushAfterWrite;
     }
 
     /**
@@ -81,7 +98,9 @@ public class ContentStreamWriter
             //write a space between each object.
             output.write( 32 );
         }
-        output.flush();
+        if (flushAfterWrite) {
+            output.flush();
+        }
     }
 
     private void writeObject( Object o ) throws IOException
@@ -176,5 +195,31 @@ public class ContentStreamWriter
     public void writeTokens( List tokens ) throws IOException
     {
         writeTokens( tokens, 0, tokens.size() );
+    }
+    
+    /**
+     * Write a single token to the output stream.
+     * 
+     * In general you should prefer to use writeTokens(...) for efficiency.
+     * 
+     * @param token The token to write; must be a valid COS basic element
+     * @throws IOException On write error
+     */
+    public void writeToken( Object token ) throws IOException
+    {
+        writeObject( token );
+        //write a space between each object.
+        output.write( 32 );
+    }
+    
+    /**
+     * Flush the underlying output stream. It's only necessary to call this
+     * if you created the ContentStreamWriter with automatic flush disabled.
+     * 
+     * Less frequent output stream flushes will improve performance.
+     */
+    public void flush() throws IOException 
+    {
+        output.flush();
     }
 }
